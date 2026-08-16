@@ -4,7 +4,7 @@ A private AltTab fork with a custom AeroSpace module.
 
 The module groups all windows from each managed AeroSpace workspace into a single card in the AltTab interface. Selecting the card activates the corresponding workspace.
 
-![Workspace card preview](workspace-card.png)
+![Workspace card preview](workspace-card.svg)
 
 ## Behavior
 
