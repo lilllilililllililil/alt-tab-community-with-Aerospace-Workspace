@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520" role="img" aria-labelledby="title desc">
+  <title id="title">AeroSpace workspace card in AltTab</title>
+  <desc id="desc">A dark AltTab workspace card labeled Workspace 2 containing three window previews.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#292929"/>
+      <stop offset="1" stop-color="#171717"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000" flood-opacity=".38"/>
+    </filter>
+  </defs>
+  <rect width="960" height="520" rx="42" fill="url(#bg)"/>
+  <g transform="translate(105 72)" filter="url(#shadow)">
+    <rect width="750" height="376" rx="24" fill="#343434" stroke="#a73bbd" stroke-width="8"/>
+    <g transform="translate(28 28)">
+      <rect width="42" height="42" rx="9" fill="#171717" stroke="#696969" stroke-width="2"/>
+      <path d="M12 14h18M12 22h10" stroke="#dbdbdb" stroke-width="3" stroke-linecap="round"/>
+      <text x="60" y="34" fill="#f1f1f1" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="30" font-weight="600">Workspace 2</text>
+    </g>
+    <g transform="translate(28 98)">
+      <rect width="214" height="238" rx="10" fill="#101417" stroke="#555"/>
+      <rect x="12" y="14" width="190" height="16" rx="3" fill="#244c2a"/>
+      <g fill="#31d34b" opacity=".9">
+        <rect x="12" y="45" width="150" height="7" rx="2"/><rect x="12" y="61" width="178" height="7" rx="2"/><rect x="12" y="77" width="128" height="7" rx="2"/><rect x="12" y="93" width="168" height="7" rx="2"/><rect x="12" y="109" width="144" height="7" rx="2"/><rect x="12" y="125" width="182" height="7" rx="2"/><rect x="12" y="141" width="116" height="7" rx="2"/><rect x="12" y="157" width="172" height="7" rx="2"/>
+      </g>
+      <rect x="230" width="214" height="238" rx="10" fill="#111417" stroke="#555"/>
+      <rect x="242" y="14" width="190" height="16" rx="3" fill="#244c2a"/>
+      <g fill="#31d34b" opacity=".9">
+        <rect x="242" y="45" width="166" height="7" rx="2"/><rect x="242" y="61" width="184" height="7" rx="2"/><rect x="242" y="77" width="132" height="7" rx="2"/><rect x="242" y="93" width="174" height="7" rx="2"/><rect x="242" y="109" width="148" height="7" rx="2"/><rect x="242" y="125" width="180" height="7" rx="2"/><rect x="242" y="141" width="124" height="7" rx="2"/><rect x="242" y="157" width="168" height="7" rx="2"/>
+      </g>
+      <rect x="460" width="234" height="238" rx="10" fill="#ececec" stroke="#777"/>
+      <rect x="460" width="234" height="28" rx="10" fill="#d2d2d2"/>
+      <circle cx="476" cy="14" r="5" fill="#ff5f57"/><circle cx="492" cy="14" r="5" fill="#febc2e"/><circle cx="508" cy="14" r="5" fill="#28c840"/>
+      <rect x="476" y="48" width="142" height="10" rx="3" fill="#b7b7b7"/><rect x="476" y="70" width="198" height="8" rx="3" fill="#c7c7c7"/><rect x="476" y="88" width="175" height="8" rx="3" fill="#c7c7c7"/>
+    </g>
+  </g>
+</svg>
