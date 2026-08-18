@@ -349,11 +349,28 @@ final class AeroSpaceWorkspaceCards {
         }
     }
 
-    func activateIfProxy(_ window: Window) -> Bool {
-        guard isThumbnailMode, let card = card(for: window) else { return false }
-        // Fast path: focus exactly one real window using AltTab's native cross-Space implementation.
-        // AeroSpace observes that focus and activates the rest of the target logical workspace.
-        card.representative.focus()
+    /// Owns activation routing while the module is enabled so AeroSpace state follows the selected card.
+    /// Workspace proxy: enable AeroSpace first, then focus its representative window.
+    /// Ordinary card: disable AeroSpace first, then let AltTab perform its normal focus path.
+    func activate(_ window: Window, ordinaryActivation: @escaping () -> Void) -> Bool {
+        guard enabled, isThumbnailMode else { return false }
+
+        if let card = card(for: window) {
+            run(["enable", "on"]) { [weak self, weak representative = card.representative] status, _ in
+                guard self != nil else { return }
+                // `enable on` reports success both when enabling and when already enabled.
+                // Do not focus the proxy target if AeroSpace could not be enabled.
+                guard status == 0 else { return }
+                representative?.focus()
+            }
+            return true
+        }
+
+        run(["enable", "off"]) { _, _ in
+            // Focusing the ordinary AltTab window is authoritative even if AeroSpace is unavailable
+            // or already disabled. Keeping this completion-based ordering avoids an enable/focus race.
+            ordinaryActivation()
+        }
         return true
     }
 
@@ -392,24 +409,22 @@ final class AeroSpaceWorkspaceCards {
             view.aeroSpacePreviewLayers.append(layer)
         }
 
-        // One icon per window, including duplicate applications, ordered by window MRU.
-        // The strip occupies AltTab's normal leading app-icon slot; the title is moved after it.
-        let iconSize = min(24, max(16, view.appIcon.frame.height))
-        let spacing: CGFloat = 3
-        let stripWidth = CGFloat(card.windows.count) * iconSize + CGFloat(max(0, card.windows.count - 1)) * spacing
-        var x = view.appIcon.frame.minX
-        let y = view.appIcon.frame.minY + max(0, (view.appIcon.frame.height - iconSize) / 2)
-        for member in card.windows {
+        // Draw all workspace app icons inside AltTab's existing app-icon slot.
+        // Never mutate the shared label frame: recycled TileViews must retain AltTab's own
+        // single-line title geometry for ordinary cards and the current-application header.
+        let slot = view.appIcon.frame
+        let iconCount = max(card.windows.count, 1)
+        let iconSize = min(slot.height, max(12, slot.width * 0.72))
+        let availableTravel = max(0, slot.width - iconSize)
+        let step = iconCount > 1 ? availableTravel / CGFloat(iconCount - 1) : 0
+        let y = slot.minY + max(0, (slot.height - iconSize) / 2)
+        for (index, member) in card.windows.enumerated() {
             let iconLayer = LightImageLayer()
             iconLayer.updateContents(.cgImage(member.icon), NSSize(width: iconSize, height: iconSize))
-            iconLayer.frame.origin = CGPoint(x: x, y: y)
+            iconLayer.frame.origin = CGPoint(x: slot.minX + CGFloat(index) * step, y: y)
             view.layer?.addSublayer(iconLayer)
             view.aeroSpaceIconLayers.append(iconLayer)
-            x += iconSize + spacing
         }
-        let titleX = view.appIcon.frame.minX + stripWidth + Appearance.appIconLabelSpacing
-        view.label.frame.origin.x = titleX
-        view.label.setWidth(max(1, view.frame.width - titleX - Appearance.edgeInsetsSize - view.statusIcons.totalWidth))
     }
 
     private func clearPresentation(in view: TileView) {
