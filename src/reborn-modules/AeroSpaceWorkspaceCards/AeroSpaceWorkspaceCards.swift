@@ -40,6 +40,7 @@ final class AeroSpaceWorkspaceCards {
     private var subscriptionBuffer = Data()
     private var subscriptionRestartWorkItem: DispatchWorkItem?
     private var topologyRefreshWorkItem: DispatchWorkItem?
+    private var topologyRefreshDeadline: TimeInterval?
     private var topologyRefreshGeneration: UInt64 = 0
     private var geometryRefreshWorkItem: DispatchWorkItem?
     private var subscriptionGeneration: UInt64 = 0
@@ -131,6 +132,7 @@ final class AeroSpaceWorkspaceCards {
         topologyRefreshGeneration &+= 1
         topologyRefreshWorkItem?.cancel()
         topologyRefreshWorkItem = nil
+        topologyRefreshDeadline = nil
         geometryRefreshWorkItem?.cancel()
         geometryRefreshWorkItem = nil
         recoveryTimer?.invalidate()
@@ -268,8 +270,17 @@ final class AeroSpaceWorkspaceCards {
             return
         }
         if queryInFlight {
+            if !pendingRefresh {
+                Self.trace("refresh.coalesced", ["reason": "scheduledWhileQueryInFlight"])
+            }
             pendingRefresh = true
-            Self.trace("refresh.coalesced", ["reason": "scheduledWhileQueryInFlight"])
+            return
+        }
+
+        let proposedDeadline = ProcessInfo.processInfo.systemUptime + delay
+        if let currentDeadline = topologyRefreshDeadline,
+           topologyRefreshWorkItem != nil,
+           currentDeadline <= proposedDeadline {
             return
         }
 
@@ -277,10 +288,15 @@ final class AeroSpaceWorkspaceCards {
         topologyRefreshGeneration &+= 1
         let generation = topologyRefreshGeneration
         topologyRefreshWorkItem?.cancel()
-        Self.trace("refresh.topology.scheduled", ["delayMs": Int(delay * 1000), "replacedPendingWork": replacedPendingWork])
+        topologyRefreshDeadline = proposedDeadline
+        Self.trace("refresh.topology.scheduled", [
+            "delayMs": Int(delay * 1000),
+            "replacedPendingWork": replacedPendingWork,
+        ])
         let work = DispatchWorkItem { [weak self] in
             guard let self, generation == self.topologyRefreshGeneration else { return }
             self.topologyRefreshWorkItem = nil
+            self.topologyRefreshDeadline = nil
             self.refresh()
         }
         topologyRefreshWorkItem = work
@@ -367,11 +383,6 @@ final class AeroSpaceWorkspaceCards {
         guard pendingRefresh else { return }
         pendingRefresh = false
         scheduleTopologyRefresh(delay: 0.05)
-    }
-
-    private func notifyWorkspaceIndicator(_ workspace: String) {
-        guard let url = URL(string: "hammerspoon://aerospace-workspace?workspace=\(workspace)") else { return }
-        NSWorkspace.shared.open(url)
     }
 
     /// Fast cross-mode phase. Wait only for the authoritative workspace transition.
@@ -546,7 +557,7 @@ final class AeroSpaceWorkspaceCards {
         case .quit:
             uniqueApplications(ordered).forEach { $0.quit() }
         case .fullscreen:
-            break
+            return false
         }
         return true
     }
@@ -602,7 +613,6 @@ final class AeroSpaceWorkspaceCards {
                 // Fail safely without creating a cross-workspace overlay when the transition failed.
                 return
             }
-            self.notifyWorkspaceIndicator("1")
             ordinaryActivation()
             Self.trace("activation.cross.focusDispatched", ["windowId": windowId])
             self.sleepAeroSpaceIfManagedWorkspacesAreEmpty()
