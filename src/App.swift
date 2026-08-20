@@ -92,6 +92,7 @@ class App: AppCenterApplication {
     static func focusTarget() {
         guard SwitcherSession.isActive else { return } // already hidden
         let selectedWindow = Windows.selectedWindow()
+        AeroSpaceWorkspaceCards.shared.traceUiEvent("ui.focusTarget", shortcutIndex: SwitcherSession.activeShortcutIndex, selectedWindow: selectedWindow)
         Logger.info { selectedWindow?.debugId }
         focusSelectedWindow(selectedWindow)
     }
@@ -211,6 +212,7 @@ class App: AppCenterApplication {
     }
 
     static func cycleSelection(_ direction: Direction, allowWrap: Bool = true) {
+        AeroSpaceWorkspaceCards.shared.traceUiEvent("ui.cycleSelection", shortcutIndex: SwitcherSession.activeShortcutIndex, selectedWindow: Windows.selectedWindow())
         (TilesView.scrollView?.documentView as? TilesDocumentView)?.cancelDraggingTimer()
         CursorEvents.resetDeadzone()
         if direction == .up || direction == .down {
@@ -273,6 +275,9 @@ class App: AppCenterApplication {
     }
 
     static func showUiOrCycleSelection(_ shortcutIndex: Int, _ forceDoNothingOnRelease_: Bool) {
+        if SwitcherSession.current == nil {
+            AeroSpaceWorkspaceCards.shared.traceUiEvent("ui.session.open", shortcutIndex: shortcutIndex, selectedWindow: Windows.selectedWindow())
+        }
         let session = SwitcherSession.current ?? {
             let new = SwitcherSession()
             SwitcherSession.current = new

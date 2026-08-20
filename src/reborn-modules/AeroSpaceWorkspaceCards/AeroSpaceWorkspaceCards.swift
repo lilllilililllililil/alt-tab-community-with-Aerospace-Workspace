@@ -32,22 +32,84 @@ final class AeroSpaceWorkspaceCards {
     private var membership = [CGWindowID: String]()
     private var layoutCache = [String: [CGWindowID: CGRect]]()
     private var cardsByRepresentative = [CGWindowID: Card]()
+    private var stickyRepresentativeByWorkspace = [String: CGWindowID]()
+    private var hasCompletedInitialRefresh = false
     private var recoveryTimer: Timer?
     private var subscriptionProcess: Process?
     private var subscriptionPipe: Pipe?
     private var subscriptionBuffer = Data()
     private var subscriptionRestartWorkItem: DispatchWorkItem?
     private var topologyRefreshWorkItem: DispatchWorkItem?
+    private var topologyRefreshGeneration: UInt64 = 0
     private var geometryRefreshWorkItem: DispatchWorkItem?
     private var subscriptionGeneration: UInt64 = 0
     private var subscriptionFailureCount = 0
     private var monitoringEnabled = false
     private var queryInFlight = false
     private var pendingRefresh = false
+    private var topologyQueriesSuspended = false
+    private var refreshNeededAfterWake = false
     private var revision: UInt64 = 0
     private var consecutiveRefreshFailures = 0
     private var lastStateFingerprint = ""
     private let executable = "/opt/homebrew/bin/aerospace"
+
+    // Temporary performance trace. Enable before launching AltTab with:
+    // defaults write com.lwouis.alt-tab-macos AeroSpaceTransitionTraceEnabled -bool true
+    // The flag is read once at process start, so disabled tracing adds only one cached Bool branch.
+    private static let traceEnabled = UserDefaults.standard.bool(forKey: "AeroSpaceTransitionTraceEnabled")
+    private static let traceQueue = DispatchQueue(label: "com.lwouis.alt-tab-macos.aerospace-transition-trace", qos: .utility)
+    private static let traceStartedAt = ProcessInfo.processInfo.systemUptime
+    private static var traceSequence: UInt64 = 0
+    private static var traceHandle: FileHandle?
+
+    private static func trace(_ event: String, _ fields: [String: Any] = [:]) {
+        guard traceEnabled else { return }
+        let uptimeMs = Int((ProcessInfo.processInfo.systemUptime - traceStartedAt) * 1000)
+        let wallTime = ISO8601DateFormatter().string(from: Date())
+        traceQueue.async {
+            traceSequence &+= 1
+            var object = fields
+            object["seq"] = traceSequence
+            object["event"] = event
+            object["wallTime"] = wallTime
+            object["uptimeMs"] = uptimeMs
+            guard JSONSerialization.isValidJSONObject(object),
+                  let payload = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
+            let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/AltTab Reborn")
+            let url = directory.appendingPathComponent("AeroSpaceTransitionTrace.jsonl")
+            if traceHandle == nil {
+                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                }
+                traceHandle = try? FileHandle(forWritingTo: url)
+                traceHandle?.seekToEndOfFile()
+            }
+            guard let handle = traceHandle else { return }
+            handle.write(payload + Data([0x0A]))
+        }
+    }
+
+    private static func elapsedMs(since start: TimeInterval) -> Int {
+        Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
+    }
+
+    func traceUiEvent(_ event: String, shortcutIndex: Int? = nil, selectedWindow: Window? = nil) {
+        var fields: [String: Any] = [
+            "focusedWorkspaceCache": focusedWorkspace,
+            "membershipCount": membership.count,
+            "queryInFlight": queryInFlight,
+            "pendingRefresh": pendingRefresh,
+        ]
+        if let shortcutIndex { fields["shortcutIndex"] = shortcutIndex }
+        if let selectedWindow {
+            fields["windowId"] = selectedWindow.cgWindowId.map(Int.init) ?? -1
+            fields["targetWorkspaceCache"] = selectedWindow.cgWindowId.flatMap { membership[$0] } ?? "unknown"
+            fields["isWorkspaceProxy"] = card(for: selectedWindow) != nil
+        }
+        Self.trace(event, fields)
+    }
 
     var enabled: Bool { Preferences.aeroSpaceWorkspaceCards }
     var isThumbnailMode: Bool {
@@ -66,8 +128,11 @@ final class AeroSpaceWorkspaceCards {
         monitoringEnabled = false
         subscriptionGeneration &+= 1
         subscriptionRestartWorkItem?.cancel()
+        topologyRefreshGeneration &+= 1
         topologyRefreshWorkItem?.cancel()
+        topologyRefreshWorkItem = nil
         geometryRefreshWorkItem?.cancel()
+        geometryRefreshWorkItem = nil
         recoveryTimer?.invalidate()
         recoveryTimer = nil
         subscriptionPipe?.fileHandleForReading.readabilityHandler = nil
@@ -77,6 +142,10 @@ final class AeroSpaceWorkspaceCards {
         subscriptionPipe = nil
         subscriptionBuffer.removeAll(keepingCapacity: false)
         pendingRefresh = false
+        topologyQueriesSuspended = false
+        refreshNeededAfterWake = false
+        hasCompletedInitialRefresh = false
+        stickyRepresentativeByWorkspace.removeAll(keepingCapacity: false)
         cardsByRepresentative.removeAll(keepingCapacity: false)
     }
 
@@ -87,7 +156,7 @@ final class AeroSpaceWorkspaceCards {
         startSubscription()
         // Rare safety net only. Normal updates are event-driven.
         recoveryTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
-            self?.refresh()
+            self?.refresh(forceProbe: true)
         }
         recoveryTimer?.tolerance = 15.0
     }
@@ -111,7 +180,11 @@ final class AeroSpaceWorkspaceCards {
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty else { return }
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                Self.trace("subscription.stdout.eof", ["generation": generation])
+                return
+            }
             DispatchQueue.main.async {
                 guard let self, generation == self.subscriptionGeneration, self.monitoringEnabled else { return }
                 self.consumeSubscriptionData(data)
@@ -149,17 +222,24 @@ final class AeroSpaceWorkspaceCards {
         while let newline = subscriptionBuffer.firstIndex(of: 0x0A) {
             let line = subscriptionBuffer.prefix(upTo: newline)
             subscriptionBuffer.removeSubrange(...newline)
-            guard !line.isEmpty,
-                  let event = try? JSONDecoder().decode(SubscriptionEvent.self, from: Data(line)) else { continue }
-            handleSubscriptionEvent(event)
+            guard !line.isEmpty else { continue }
+            do {
+                let event = try JSONDecoder().decode(SubscriptionEvent.self, from: Data(line))
+                handleSubscriptionEvent(event)
+            } catch {
+                Self.trace("subscription.decode.failed", [
+                    "bytes": line.count,
+                    "error": String(describing: error),
+                ])
+            }
         }
     }
 
     private func handleSubscriptionEvent(_ event: SubscriptionEvent) {
         subscriptionFailureCount = 0
+        resumeTopologyQueries(source: "subscription.\(event.event)")
         if event.event == "focused-workspace-changed", let workspace = event.workspace {
             focusedWorkspace = workspace
-            scheduleGeometryRefresh(delay: 0.12)
             scheduleTopologyRefresh(delay: 0.10)
         } else if event.event == "focus-changed" {
             if let workspace = event.workspace { focusedWorkspace = workspace }
@@ -180,8 +260,29 @@ final class AeroSpaceWorkspaceCards {
     }
 
     private func scheduleTopologyRefresh(delay: TimeInterval) {
+        if topologyQueriesSuspended {
+            if !refreshNeededAfterWake {
+                Self.trace("refresh.skipped.disabled", ["delayMs": Int(delay * 1000)])
+            }
+            refreshNeededAfterWake = true
+            return
+        }
+        if queryInFlight {
+            pendingRefresh = true
+            Self.trace("refresh.coalesced", ["reason": "scheduledWhileQueryInFlight"])
+            return
+        }
+
+        let replacedPendingWork = topologyRefreshWorkItem != nil
+        topologyRefreshGeneration &+= 1
+        let generation = topologyRefreshGeneration
         topologyRefreshWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.refresh() }
+        Self.trace("refresh.topology.scheduled", ["delayMs": Int(delay * 1000), "replacedPendingWork": replacedPendingWork])
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, generation == self.topologyRefreshGeneration else { return }
+            self.topologyRefreshWorkItem = nil
+            self.refresh()
+        }
         topologyRefreshWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
@@ -190,27 +291,59 @@ final class AeroSpaceWorkspaceCards {
         geometryRefreshWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            self.geometryRefreshWorkItem = nil
             self.captureActiveLayout()
         }
         geometryRefreshWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
+    private func suspendTopologyQueries(status: Int32) {
+        queryInFlight = false
+        pendingRefresh = false
+        let wasSuspended = topologyQueriesSuspended
+        topologyQueriesSuspended = true
+        refreshNeededAfterWake = false
+        if !wasSuspended {
+            Self.trace("refresh.suspended", ["status": status])
+        }
+    }
+    private func resumeTopologyQueries(source: String) {
+        guard topologyQueriesSuspended else { return }
+        topologyQueriesSuspended = false
+        let needsRefresh = refreshNeededAfterWake
+        refreshNeededAfterWake = false
+        Self.trace("refresh.resumed", ["source": source, "refreshNeeded": needsRefresh])
+    }
     /// Background cache refresh. This is never called from shortcut/show/navigation paths.
-    private func refresh() {
+    /// forceProbe is reserved for the low-frequency recovery timer while AeroSpace is OFF.
+    private func refresh(forceProbe: Bool = false) {
         guard enabled, FileManager.default.isExecutableFile(atPath: executable) else { return }
+        guard forceProbe || !topologyQueriesSuspended else {
+            refreshNeededAfterWake = true
+            return
+        }
         if queryInFlight {
             pendingRefresh = true
+            Self.trace("refresh.coalesced", ["reason": "queryInFlight"])
             return
         }
         queryInFlight = true
+        let refreshStartedAt = ProcessInfo.processInfo.systemUptime
+        Self.trace("refresh.started")
         run(["list-windows", "--all", "--json", "--format", "%{window-id} %{workspace}"]) { [weak self] status, data in
             guard let self else { return }
             guard status == 0, let entries = try? JSONDecoder().decode([Entry].self, from: data) else {
-                self.finishRefresh()
                 self.consecutiveRefreshFailures += 1
+                Self.trace("refresh.finished", ["ok": false, "stage": "listWindows", "status": status, "durationMs": Self.elapsedMs(since: refreshStartedAt)])
+                if status == 2 {
+                    self.suspendTopologyQueries(status: status)
+                } else {
+                    self.finishRefresh()
+                }
                 return
             }
+            self.resumeTopologyQueries(source: forceProbe ? "recoveryProbe" : "listWindows.success")
             self.run(["list-workspaces", "--focused"]) { [weak self] focusStatus, focusData in
                 guard let self else { return }
                 self.finishRefresh()
@@ -218,10 +351,13 @@ final class AeroSpaceWorkspaceCards {
                       let value = String(data: focusData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !value.isEmpty else {
                     self.consecutiveRefreshFailures += 1
+                    Self.trace("refresh.finished", ["ok": false, "stage": "focusedWorkspace", "status": focusStatus, "durationMs": Self.elapsedMs(since: refreshStartedAt)])
                     return
                 }
                 self.consecutiveRefreshFailures = 0
                 self.apply(entries, focusedWorkspace: value)
+                self.hasCompletedInitialRefresh = true
+                Self.trace("refresh.finished", ["ok": true, "entries": entries.count, "workspace": value, "durationMs": Self.elapsedMs(since: refreshStartedAt)])
             }
         }
     }
@@ -233,6 +369,63 @@ final class AeroSpaceWorkspaceCards {
         scheduleTopologyRefresh(delay: 0.05)
     }
 
+    private func notifyWorkspaceIndicator(_ workspace: String) {
+        guard let url = URL(string: "hammerspoon://aerospace-workspace?workspace=\(workspace)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Fast cross-mode phase. Wait only for the authoritative workspace transition.
+    /// The potentially slower empty-workspace check runs after the target window receives focus.
+    private func transitionToDefaultWorkspace(completion: @escaping (Bool) -> Void) {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        Self.trace("transition.default.workspace.started", ["fromWorkspaceCache": focusedWorkspace])
+        run(["workspace", "⠀"]) { status, _ in
+            Self.trace("transition.default.workspace.finished", [
+                "status": status,
+                "durationMs": Self.elapsedMs(since: startedAt),
+            ])
+            completion(status == 0)
+        }
+    }
+
+    /// Post-focus maintenance. One targeted authoritative query decides whether AeroSpace may sleep.
+    /// Query, parse, or disable failure is fail-open, so AeroSpace remains enabled.
+    private func sleepAeroSpaceIfManagedWorkspacesAreEmpty() {
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        Self.trace("transition.default.sleepCheck.started")
+        run(["list-windows", "--workspace", "2", "3", "4", "5", "--count"]) { [weak self] status, data in
+            guard let self else { return }
+            let output = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard status == 0, let output, let count = Int(output) else {
+                Self.trace("transition.default.sleepCheck.finished", [
+                    "status": status,
+                    "result": "queryFailedKeptEnabled",
+                    "durationMs": Self.elapsedMs(since: startedAt),
+                ])
+                return
+            }
+            guard count == 0 else {
+                Self.trace("transition.default.sleepCheck.finished", [
+                    "status": status,
+                    "result": "keptEnabledManagedWindowsExist",
+                    "managedWindowCount": count,
+                    "durationMs": Self.elapsedMs(since: startedAt),
+                ])
+                return
+            }
+            self.run(["enable", "off"]) { disableStatus, _ in
+                Self.trace("transition.default.sleepCheck.finished", [
+                    "status": disableStatus,
+                    "result": disableStatus == 0
+                        ? "disabledManagedWorkspacesEmpty"
+                        : "disableFailedKeptEnabled",
+                    "managedWindowCount": count,
+                    "durationMs": Self.elapsedMs(since: startedAt),
+                ])
+            }
+        }
+    }
     private func run(_ arguments: [String], completion: @escaping (Int32, Data) -> Void) {
         let process = Process()
         let output = Pipe()
@@ -249,7 +442,10 @@ final class AeroSpaceWorkspaceCards {
 
     private func apply(_ entries: [Entry], focusedWorkspace: String) {
         self.focusedWorkspace = focusedWorkspace
-        membership = Dictionary(uniqueKeysWithValues: entries.map { (CGWindowID($0.windowId), $0.workspace) })
+        membership = Dictionary(
+            entries.map { (CGWindowID($0.windowId), $0.workspace) },
+            uniquingKeysWith: { _, new in new }
+        )
         captureActiveLayout()
         let fingerprint = stateFingerprint(entries)
         guard fingerprint != lastStateFingerprint else { return }
@@ -280,22 +476,37 @@ final class AeroSpaceWorkspaceCards {
     func applyProjection() {
         reconcileMonitoring()
         cardsByRepresentative.removeAll(keepingCapacity: true)
-        guard enabled, isThumbnailMode else { return }
+        guard enabled, isThumbnailMode, hasCompletedInitialRefresh else { return }
         let candidates = Windows.list.filter {
             guard let wid = $0.cgWindowId, !$0.isFullscreen, $0.shouldShowTheUser,
                   let workspace = membership[wid] else { return false }
             return Self.managedWorkspaces.contains(workspace)
         }
         let groups = Dictionary(grouping: candidates) { membership[$0.cgWindowId!]! }
+        let activeWorkspaces = Set(groups.keys)
+        stickyRepresentativeByWorkspace = stickyRepresentativeByWorkspace.filter { activeWorkspaces.contains($0.key) }
+
         for workspace in Self.managedWorkspaces.sorted() {
             guard let members = groups[workspace], !members.isEmpty else { continue }
             let ordered = members.sorted { $0.lastFocusOrder < $1.lastFocusOrder }
-            guard let representative = ordered.first, let wid = representative.cgWindowId else { continue }
-            ordered.dropFirst().forEach { $0.shouldShowTheUser = false }
-            cardsByRepresentative[wid] = Card(workspace: workspace,
-                                               representative: representative,
-                                               windows: ordered,
-                                               frames: layoutCache[workspace] ?? [:])
+
+            let representative: Window
+            if let stickyId = stickyRepresentativeByWorkspace[workspace],
+               let stickyWindow = ordered.first(where: { $0.cgWindowId == stickyId }) {
+                representative = stickyWindow
+            } else {
+                guard let initialRepresentative = ordered.first,
+                      let initialId = initialRepresentative.cgWindowId else { continue }
+                representative = initialRepresentative
+                stickyRepresentativeByWorkspace[workspace] = initialId
+            }
+
+            guard let representativeId = representative.cgWindowId else { continue }
+            ordered.filter { $0.cgWindowId != representativeId }.forEach { $0.shouldShowTheUser = false }
+            cardsByRepresentative[representativeId] = Card(workspace: workspace,
+                                                           representative: representative,
+                                                           windows: ordered,
+                                                           frames: layoutCache[workspace] ?? [:])
         }
     }
 
@@ -349,27 +560,52 @@ final class AeroSpaceWorkspaceCards {
         }
     }
 
-    /// Owns activation routing while the module is enabled so AeroSpace state follows the selected card.
-    /// Workspace proxy: enable AeroSpace first, then focus its representative window.
-    /// Ordinary card: disable AeroSpace first, then let AltTab perform its normal focus path.
+    /// Routes activation without adding work to ordinary same-mode switching.
+    /// - Workspace proxy 2-5: enable AeroSpace, then focus its representative window.
+    /// - Ordinary U+2800 window while already on U+2800: return false for native window.focus().
+    /// - Ordinary U+2800 window while on 2-5: enter U+2800, conditionally sleep AeroSpace, then focus.
+    /// - Unknown/non-U+2800 ordinary targets: return false and preserve AltTab's native behavior.
     func activate(_ window: Window, ordinaryActivation: @escaping () -> Void) -> Bool {
         guard enabled, isThumbnailMode else { return false }
+        let windowId = window.cgWindowId.map(Int.init) ?? -1
+        let targetWorkspace = window.cgWindowId.flatMap { membership[$0] } ?? "unknown"
 
         if let card = card(for: window) {
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            Self.trace("activation.route", ["route": "workspaceProxy", "windowId": windowId, "fromWorkspaceCache": focusedWorkspace, "targetWorkspace": card.workspace])
             run(["enable", "on"]) { [weak self, weak representative = card.representative] status, _ in
-                guard self != nil else { return }
-                // `enable on` reports success both when enabling and when already enabled.
-                // Do not focus the proxy target if AeroSpace could not be enabled.
-                guard status == 0 else { return }
+                Self.trace("activation.proxy.enable.finished", ["status": status, "durationMs": Self.elapsedMs(since: startedAt), "targetWorkspace": card.workspace])
+                guard let self, status == 0 else { return }
+                self.resumeTopologyQueries(source: "workspaceProxy.enable")
+                // Focus is latency-critical; the cache refresh remains asynchronous.
                 representative?.focus()
+                self.scheduleTopologyRefresh(delay: 0.10)
             }
             return true
         }
 
-        run(["enable", "off"]) { _, _ in
-            // Focusing the ordinary AltTab window is authoritative even if AeroSpace is unavailable
-            // or already disabled. Keeping this completion-based ordering avoids an enable/focus race.
+        guard let cgWindowId = window.cgWindowId, membership[cgWindowId] == "⠀" else {
+            Self.trace("activation.route", ["route": "nativeUnknown", "windowId": windowId, "fromWorkspaceCache": focusedWorkspace, "targetWorkspace": targetWorkspace])
+            return false
+        }
+
+        // Fast path: switching between ordinary windows on U+2800 remains a native focus only.
+        guard Self.managedWorkspaces.contains(focusedWorkspace) else {
+            Self.trace("activation.route", ["route": "nativeDefaultWorkspace", "windowId": windowId, "fromWorkspaceCache": focusedWorkspace, "targetWorkspace": "⠀"])
+            return false
+        }
+
+        Self.trace("activation.route", ["route": "crossToDefault", "windowId": windowId, "fromWorkspaceCache": focusedWorkspace, "targetWorkspace": "⠀"])
+        transitionToDefaultWorkspace { [weak self] transitionSucceeded in
+            Self.trace("activation.cross.focusDecision", ["transitionSucceeded": transitionSucceeded, "windowId": windowId])
+            guard let self, transitionSucceeded else {
+                // Fail safely without creating a cross-workspace overlay when the transition failed.
+                return
+            }
+            self.notifyWorkspaceIndicator("1")
             ordinaryActivation()
+            Self.trace("activation.cross.focusDispatched", ["windowId": windowId])
+            self.sleepAeroSpaceIfManagedWorkspacesAreEmpty()
         }
         return true
     }
@@ -409,22 +645,23 @@ final class AeroSpaceWorkspaceCards {
             view.aeroSpacePreviewLayers.append(layer)
         }
 
-        // Draw all workspace app icons inside AltTab's existing app-icon slot.
-        // Never mutate the shared label frame: recycled TileViews must retain AltTab's own
-        // single-line title geometry for ordinary cards and the current-application header.
-        let slot = view.appIcon.frame
-        let iconCount = max(card.windows.count, 1)
-        let iconSize = min(slot.height, max(12, slot.width * 0.72))
-        let availableTravel = max(0, slot.width - iconSize)
-        let step = iconCount > 1 ? availableTravel / CGFloat(iconCount - 1) : 0
-        let y = slot.minY + max(0, (slot.height - iconSize) / 2)
+        // One full-size icon per window, including duplicate applications, ordered by MRU.
+        // The workspace card temporarily extends the normal leading icon strip. clearPresentation()
+        // restores AltTab's standard single-line label geometry before a recycled tile is reused.
+        let iconSize = max(1, view.appIcon.frame.height)
+        let spacing: CGFloat = 3
+        let stripWidth = CGFloat(card.windows.count) * iconSize + CGFloat(max(0, card.windows.count - 1)) * spacing
+        let y = view.appIcon.frame.minY + max(0, (view.appIcon.frame.height - iconSize) / 2)
         for (index, member) in card.windows.enumerated() {
             let iconLayer = LightImageLayer()
             iconLayer.updateContents(.cgImage(member.icon), NSSize(width: iconSize, height: iconSize))
-            iconLayer.frame.origin = CGPoint(x: slot.minX + CGFloat(index) * step, y: y)
+            iconLayer.frame.origin = CGPoint(x: view.appIcon.frame.minX + CGFloat(index) * (iconSize + spacing), y: y)
             view.layer?.addSublayer(iconLayer)
             view.aeroSpaceIconLayers.append(iconLayer)
         }
+        let titleX = view.appIcon.frame.minX + stripWidth + Appearance.appIconLabelSpacing
+        view.label.frame.origin.x = titleX
+        view.label.setWidth(max(1, view.frame.width - titleX - Appearance.edgeInsetsSize - view.statusIcons.totalWidth))
     }
 
     private func clearPresentation(in view: TileView) {
@@ -434,6 +671,22 @@ final class AeroSpaceWorkspaceCards {
         view.aeroSpacePreviewLayers.removeAll(keepingCapacity: true)
         view.aeroSpaceIconLayers.removeAll(keepingCapacity: true)
         view.aeroSpaceDecorationLayers.removeAll(keepingCapacity: true)
+
+        // TileViews are recycled. Always restore AltTab's native title geometry so workspace-card
+        // presentation cannot leak into ordinary cards or the selected/current application title.
+        let edgeInsets = Appearance.edgeInsetsSize
+        let contentWidth = view.frame.width - edgeInsets * 2
+        let standardLabelWidth = contentWidth - view.appIcon.frame.width - Appearance.appIconLabelSpacing - view.statusIcons.totalWidth
+        if App.shared.userInterfaceLayoutDirection == .leftToRight {
+            view.label.frame.origin.x = view.appIcon.frame.maxX + Appearance.appIconLabelSpacing
+        } else {
+            view.label.frame.origin.x = edgeInsets + contentWidth - view.appIcon.frame.width - Appearance.appIconLabelSpacing - standardLabelWidth
+        }
+        view.label.setWidth(max(1, standardLabelWidth))
+        view.label.maximumNumberOfLines = 1
+        view.label.usesSingleLineMode = true
+        view.label.cell?.wraps = false
+
         view.thumbnail.isHidden = Appearance.hideThumbnails
         view.appIcon.isHidden = false
     }
