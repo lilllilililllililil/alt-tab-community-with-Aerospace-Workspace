@@ -59,6 +59,10 @@ class App: AppCenterApplication {
 
     static func hideUi(_ keepPreview: Bool = false) {
         Logger.info { "active:\(SwitcherSession.isActive)" }
+        // Cancel any pending reveal so a fast Cmd+Tab (released before the 50 ms window)
+        // never builds or shows the panel at all.
+        SwitcherSession.current?.pendingRevealWorkItem?.cancel()
+        SwitcherSession.current?.pendingRevealWorkItem = nil
         guard SwitcherSession.current != nil else { return } // already hidden
         SwitcherSession.current = nil
         KeyboardEvents.updateEscapeAbsorptionTap() // session closed: stop tapping keyDown (#5766)
@@ -307,7 +311,11 @@ class App: AppCenterApplication {
             if !Windows.updatesBeforeShowing() { hideUi(); return }
             Windows.setInitialSelectedAndHoveredWindowIndex()
             if Preferences.windowDisplayDelay == DispatchTimeInterval.milliseconds(0) {
-                buildUiAndShowPanel()
+                // 50 ms pending-reveal: if the trigger is released before this fires,
+                // hideUi() cancels the item and the panel is never built (fast A/B).
+                let work = DispatchWorkItem { buildUiAndShowPanel() }
+                session.pendingRevealWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50), execute: work)
             } else {
                 delayedDisplayScheduled += 1
                 DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + Preferences.windowDisplayDelay) { () -> () in

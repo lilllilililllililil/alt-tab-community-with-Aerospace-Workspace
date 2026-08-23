@@ -28,11 +28,30 @@ final class AeroSpaceWorkspaceCards {
         let frames: [CGWindowID: CGRect]
     }
 
+    // Stops restarting the subscribe subprocess after 5 failures in 30 s.
+    // Prevents an infinite spawn loop when AeroSpace is not running.
+    private struct SubscriptionCircuitBreaker {
+        private var failureTimes: [TimeInterval] = []
+        private let window: TimeInterval = 30.0
+        private let maxFailures: Int = 5
+        /// Current count of failures within the sliding window.
+        var failureCount: Int { failureTimes.count }
+        /// Returns true when the circuit opens (caller should stop restarting).
+        mutating func recordFailure(at t: TimeInterval) -> Bool {
+            failureTimes = failureTimes.filter { t - $0 < window }
+            failureTimes.append(t)
+            return failureTimes.count >= maxFailures
+        }
+        mutating func reset() { failureTimes = [] }
+    }
+
     private(set) var focusedWorkspace = "⠀"
     private var membership = [CGWindowID: String]()
     private var layoutCache = [String: [CGWindowID: CGRect]]()
     private var cardsByRepresentative = [CGWindowID: Card]()
     private var stickyRepresentativeByWorkspace = [String: CGWindowID]()
+    // Tracks workspace usage order; MRU head is shown first in the switcher.
+    private var workspaceMruOrder: [String] = []
     private var hasCompletedInitialRefresh = false
     private var recoveryTimer: Timer?
     private var subscriptionProcess: Process?
@@ -44,7 +63,7 @@ final class AeroSpaceWorkspaceCards {
     private var topologyRefreshGeneration: UInt64 = 0
     private var geometryRefreshWorkItem: DispatchWorkItem?
     private var subscriptionGeneration: UInt64 = 0
-    private var subscriptionFailureCount = 0
+    private var subscriptionCircuit = SubscriptionCircuitBreaker()
     private var monitoringEnabled = false
     private var queryInFlight = false
     private var pendingRefresh = false
@@ -147,8 +166,24 @@ final class AeroSpaceWorkspaceCards {
         topologyQueriesSuspended = false
         refreshNeededAfterWake = false
         hasCompletedInitialRefresh = false
+        subscriptionCircuit.reset()
         stickyRepresentativeByWorkspace.removeAll(keepingCapacity: false)
         cardsByRepresentative.removeAll(keepingCapacity: false)
+        workspaceMruOrder.removeAll(keepingCapacity: false)
+    }
+
+    /// Pauses the AeroSpace subscribe pipe while the screen is locked.
+    /// No topology changes are meaningful during lock, so we skip the I/O entirely.
+    func suspendForScreenLock() {
+        subscriptionPipe?.fileHandleForReading.readabilityHandler = nil
+        Self.trace("subscription.screenLock.suspend")
+    }
+
+    /// Resumes the subscription and schedules a topology refresh after screen unlock.
+    func resumeAfterScreenLock() {
+        Self.trace("subscription.screenLock.resume")
+        startSubscription()
+        scheduleTopologyRefresh(delay: 1.0)
     }
 
     func start() {
@@ -174,7 +209,10 @@ final class AeroSpaceWorkspaceCards {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["subscribe", "--no-send-initial", "focused-workspace-changed", "focus-changed", "window-detected"]
+        // focus-changed is intentionally omitted: geometry updates are already driven by
+        // AltTab's own WindowServerEvents (SkyLight notify-proc), so the extra subprocess
+        // stdout stream is redundant and wastes main-thread wake-ups.
+        process.arguments = ["subscribe", "--no-send-initial", "focused-workspace-changed", "window-detected"]
         process.standardOutput = pipe
         process.standardError = Pipe()
         subscriptionProcess = process
@@ -211,9 +249,13 @@ final class AeroSpaceWorkspaceCards {
         subscriptionProcess = nil
         subscriptionPipe = nil
         guard enabled, monitoringEnabled else { return }
+        let t = ProcessInfo.processInfo.systemUptime
+        if subscriptionCircuit.recordFailure(at: t) {
+            Self.trace("subscription.circuitOpen", ["note": "too many failures; stopped restarting"])
+            return
+        }
         let delays: [TimeInterval] = [2, 5, 15, 30, 30]
-        let delay = delays[min(subscriptionFailureCount, delays.count - 1)]
-        subscriptionFailureCount = min(subscriptionFailureCount + 1, delays.count - 1)
+        let delay = delays[min(subscriptionCircuit.failureCount - 1, delays.count - 1)]
         let work = DispatchWorkItem { [weak self] in self?.startSubscription() }
         subscriptionRestartWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -238,17 +280,22 @@ final class AeroSpaceWorkspaceCards {
     }
 
     private func handleSubscriptionEvent(_ event: SubscriptionEvent) {
-        subscriptionFailureCount = 0
+        subscriptionCircuit.reset()
         resumeTopologyQueries(source: "subscription.\(event.event)")
         if event.event == "focused-workspace-changed", let workspace = event.workspace {
             focusedWorkspace = workspace
+            promoteWorkspaceInMru(workspace)
             scheduleTopologyRefresh(delay: 0.10)
-        } else if event.event == "focus-changed" {
-            if let workspace = event.workspace { focusedWorkspace = workspace }
-            scheduleGeometryRefresh(delay: 0.08)
         } else if event.event == "window-detected" {
             scheduleTopologyRefresh(delay: 0.15)
         }
+    }
+
+    /// Moves workspace to the front of the MRU list so the switcher shows
+    /// the most-recently-used workspace first.
+    private func promoteWorkspaceInMru(_ workspace: String) {
+        workspaceMruOrder.removeAll { $0 == workspace }
+        workspaceMruOrder.insert(workspace, at: 0)
     }
 
     /// Called by AltTab's existing WindowServer stream. Geometry changes are local and need no CLI.
@@ -332,8 +379,9 @@ final class AeroSpaceWorkspaceCards {
         Self.trace("refresh.resumed", ["source": source, "refreshNeeded": needsRefresh])
     }
     /// Background cache refresh. This is never called from shortcut/show/navigation paths.
-    /// forceProbe is reserved for the low-frequency recovery timer while AeroSpace is OFF.
-    private func refresh(forceProbe: Bool = false) {
+    /// forceProbe is reserved for the low-frequency recovery timer and the post-wake probe.
+    /// `internal` so SleepWakeEvents can issue a forced probe after AeroSpace boots up again.
+    func refresh(forceProbe: Bool = false) {
         guard enabled, FileManager.default.isExecutableFile(atPath: executable) else { return }
         guard forceProbe || !topologyQueriesSuspended else {
             refreshNeededAfterWake = true
@@ -509,7 +557,13 @@ final class AeroSpaceWorkspaceCards {
         let activeWorkspaces = Set(groups.keys)
         stickyRepresentativeByWorkspace = stickyRepresentativeByWorkspace.filter { activeWorkspaces.contains($0.key) }
 
-        for workspace in Self.managedWorkspaces.sorted() {
+        // Show workspaces in MRU order (most recently focused first).
+        // Fall back to alphabetical for any workspace not yet in the MRU list.
+        let managed = Self.managedWorkspaces
+        let mruFiltered = workspaceMruOrder.filter { managed.contains($0) }
+        let remaining = managed.sorted().filter { !workspaceMruOrder.contains($0) }
+        let workspaceOrder = mruFiltered + remaining
+        for workspace in workspaceOrder {
             guard let members = groups[workspace], !members.isEmpty else { continue }
             let ordered = members.sorted { $0.lastFocusOrder < $1.lastFocusOrder }
 
@@ -776,7 +830,7 @@ final class AeroSpaceWorkspaceCards {
                                      "consecutiveRefreshFailures": consecutiveRefreshFailures,
                                      "eventDriven": true,
                                      "subscriptionRunning": subscriptionProcess?.isRunning == true,
-                                     "subscriptionFailureCount": subscriptionFailureCount,
+                                     "subscriptionFailureCount": subscriptionCircuit.failureCount,
                                      "monitoringEnabled": monitoringEnabled,
                                      "recoveryIntervalSeconds": 60,
                                      "focusedWorkspace": focusedWorkspace,

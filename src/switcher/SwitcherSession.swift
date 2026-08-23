@@ -22,4 +22,7 @@ final class SwitcherSession {
     var hoveredIndex: Int?
     var selectedTarget: String?
     var searchQuery: String = ""
+    /// Pending work item scheduled to build + show the UI after the reveal delay.
+    /// Cancelled by `App.hideUi` if the trigger is released before it fires (fast A/B).
+    var pendingRevealWorkItem: DispatchWorkItem?
 }

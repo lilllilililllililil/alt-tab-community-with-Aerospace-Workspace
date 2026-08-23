@@ -19,6 +19,7 @@ class ScreenLockEvents {
     @objc private static func handleLocked() {
         Logger.info { "" }
         isScreenLocked = true
+        AeroSpaceWorkspaceCards.shared.suspendForScreenLock()
     }
 
     @objc private static func handleUnlocked() {
@@ -26,5 +27,6 @@ class ScreenLockEvents {
         isScreenLocked = false
         // a locked/idle screen can let macOS disable our event taps (kCGEventTapDisabledByTimeout); re-enable on unlock (#5723)
         SleepWakeEvents.reEnableAllTaps()
+        AeroSpaceWorkspaceCards.shared.resumeAfterScreenLock()
     }
 }

@@ -13,6 +13,12 @@ class SleepWakeEvents {
         Logger.info { "" }
         AeroSpaceWorkspaceCards.shared.notifyWindowServerChange(topologyChanged: true)
         reEnableAllTaps()
+        // AeroSpace needs a moment to fully restart after wake. The immediate query
+        // often exits with code 2 (suspending all further queries). Issue a forced
+        // probe after 2.5 s so we don't wait the full 60 s recovery timer.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            AeroSpaceWorkspaceCards.shared.refresh(forceProbe: true)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { reEnableAllTaps() }
     }
 
