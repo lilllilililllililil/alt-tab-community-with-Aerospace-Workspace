@@ -21,3 +21,4 @@ codesign.p12
 /scripts/l10n/missing-translations.json
 /ai/output/
 logs/
+src/reborn-modules/AeroSpaceWorkspaceCards/example.lua
