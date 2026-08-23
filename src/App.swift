@@ -318,13 +318,15 @@ class App: AppCenterApplication {
                 }
             }
         } else {
+            if !session.isUiShown { buildUiAndShowPanel() }
             cycleSelection(.leading)
             KeyRepeatTimer.startRepeatingKeyNextWindow()
         }
     }
 
     static func buildUiAndShowPanel() {
-        guard SwitcherSession.isActive else { return }
+        guard let session = SwitcherSession.current, !session.isUiShown else { return }
+        session.isUiShown = true
         Appearance.update()
         guard SwitcherSession.isActive else { return }
         TilesView.swapBackgroundViewIfNeeded()

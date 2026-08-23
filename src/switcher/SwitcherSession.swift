@@ -16,6 +16,7 @@ final class SwitcherSession {
     var shortcutIndex: Int = 0
     var isFirstSummon: Bool = true
     var forceDoNothingOnRelease: Bool = false
+    var isUiShown: Bool = false
 
     var selectedIndex: Int = 0
     var hoveredIndex: Int?

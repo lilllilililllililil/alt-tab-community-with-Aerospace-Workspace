@@ -385,6 +385,15 @@ final class AeroSpaceWorkspaceCards {
         scheduleTopologyRefresh(delay: 0.05)
     }
 
+    private func setKarabinerSleepingState(_ sleeping: Bool) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli")
+        process.arguments = ["--set-variables", "{\"aerospace_sleeping\":\(sleeping)}"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try? process.run()
+    }
+
     /// Fast cross-mode phase. Wait only for the authoritative workspace transition.
     /// The potentially slower empty-workspace check runs after the target window receives focus.
     private func transitionToDefaultWorkspace(completion: @escaping (Bool) -> Void) {
@@ -426,6 +435,9 @@ final class AeroSpaceWorkspaceCards {
                 return
             }
             self.run(["enable", "off"]) { disableStatus, _ in
+                if disableStatus == 0 {
+                    self.setKarabinerSleepingState(true)
+                }
                 Self.trace("transition.default.sleepCheck.finished", [
                     "status": disableStatus,
                     "result": disableStatus == 0
@@ -587,6 +599,7 @@ final class AeroSpaceWorkspaceCards {
             run(["enable", "on"]) { [weak self, weak representative = card.representative] status, _ in
                 Self.trace("activation.proxy.enable.finished", ["status": status, "durationMs": Self.elapsedMs(since: startedAt), "targetWorkspace": card.workspace])
                 guard let self, status == 0 else { return }
+                self.setKarabinerSleepingState(false)
                 self.resumeTopologyQueries(source: "workspaceProxy.enable")
                 // Focus is latency-critical; the cache refresh remains asynchronous.
                 representative?.focus()
