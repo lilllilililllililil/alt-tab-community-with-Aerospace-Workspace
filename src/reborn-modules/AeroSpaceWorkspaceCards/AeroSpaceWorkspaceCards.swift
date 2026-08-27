@@ -64,6 +64,17 @@ final class AeroSpaceWorkspaceCards {
     private var geometryRefreshWorkItem: DispatchWorkItem?
     private var subscriptionGeneration: UInt64 = 0
     private var subscriptionCircuit = SubscriptionCircuitBreaker()
+    private var topologyCommitObserverInstalled = false
+    private var refreshOpenUiAfterExternalCommit = false
+    private var lastExternalTopologyCommitAt: TimeInterval?
+    private var lastSuccessfulTopologyRefreshAt: TimeInterval?
+    private var screenUnlockGraceUntil: TimeInterval?
+    private var activeRefreshSource: String?
+    private var topologyQueryGeneration: UInt64 = 0
+    private let externalCommitWindowServerGrace: TimeInterval = 0.30
+    private let successfulRefreshWindowServerCooldown: TimeInterval = 0.30
+    private let screenUnlockWindowServerGrace: TimeInterval = 1.20
+    private var screenLocked = false
     private var monitoringEnabled = false
     private var queryInFlight = false
     private var pendingRefresh = false
@@ -167,6 +178,14 @@ final class AeroSpaceWorkspaceCards {
         refreshNeededAfterWake = false
         hasCompletedInitialRefresh = false
         subscriptionCircuit.reset()
+        removeTopologyCommitObserver()
+        refreshOpenUiAfterExternalCommit = false
+        lastExternalTopologyCommitAt = nil
+        lastSuccessfulTopologyRefreshAt = nil
+        screenUnlockGraceUntil = nil
+        activeRefreshSource = nil
+        topologyQueryGeneration &+= 1
+        screenLocked = false
         stickyRepresentativeByWorkspace.removeAll(keepingCapacity: false)
         cardsByRepresentative.removeAll(keepingCapacity: false)
         workspaceMruOrder.removeAll(keepingCapacity: false)
@@ -175,20 +194,37 @@ final class AeroSpaceWorkspaceCards {
     /// Pauses the AeroSpace subscribe pipe while the screen is locked.
     /// No topology changes are meaningful during lock, so we skip the I/O entirely.
     func suspendForScreenLock() {
+        screenLocked = true
         subscriptionPipe?.fileHandleForReading.readabilityHandler = nil
-        Self.trace("subscription.screenLock.suspend")
+        topologyRefreshGeneration &+= 1
+        topologyRefreshWorkItem?.cancel()
+        topologyRefreshWorkItem = nil
+        topologyRefreshDeadline = nil
+        geometryRefreshWorkItem?.cancel()
+        geometryRefreshWorkItem = nil
+        topologyQueryGeneration &+= 1
+        queryInFlight = false
+        activeRefreshSource = nil
+        pendingRefresh = false
+        Self.trace("subscription.screenLock.suspend", ["topologyWorkCancelled": true])
     }
 
-    /// Resumes the subscription and schedules a topology refresh after screen unlock.
+    /// Resumes the subscription and schedules one authoritative refresh after screen unlock.
     func resumeAfterScreenLock() {
-        Self.trace("subscription.screenLock.resume")
+        screenLocked = false
+        let now = ProcessInfo.processInfo.systemUptime
+        screenUnlockGraceUntil = now + screenUnlockWindowServerGrace
+        Self.trace("subscription.screenLock.resume", [
+            "windowServerGraceMs": Int(screenUnlockWindowServerGrace * 1000),
+        ])
         startSubscription()
-        scheduleTopologyRefresh(delay: 1.0)
+        scheduleTopologyRefresh(delay: 1.0, source: "screenUnlock")
     }
 
     func start() {
         guard enabled, recoveryTimer == nil else { return }
         monitoringEnabled = true
+        installTopologyCommitObserver()
         refresh()
         startSubscription()
         // Rare safety net only. Normal updates are event-driven.
@@ -196,6 +232,54 @@ final class AeroSpaceWorkspaceCards {
             self?.refresh(forceProbe: true)
         }
         recoveryTimer?.tolerance = 15.0
+    }
+
+    private static let topologyCommitNotification = "com.alttab.aerospace.topology-changed" as CFString
+
+    private func installTopologyCommitObserver() {
+        guard !topologyCommitObserverInstalled else { return }
+        topologyCommitObserverInstalled = true
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer else { return }
+                let instance = Unmanaged<AeroSpaceWorkspaceCards>.fromOpaque(observer).takeUnretainedValue()
+                DispatchQueue.main.async { instance.handleExternalTopologyCommit() }
+            },
+            Self.topologyCommitNotification,
+            nil,
+            .deliverImmediately
+        )
+        Self.trace("topology.externalCommit.observerInstalled")
+    }
+
+    private func removeTopologyCommitObserver() {
+        guard topologyCommitObserverInstalled else { return }
+        topologyCommitObserverInstalled = false
+        CFNotificationCenterRemoveObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            Unmanaged.passUnretained(self).toOpaque(),
+            CFNotificationName(Self.topologyCommitNotification),
+            nil
+        )
+        Self.trace("topology.externalCommit.observerRemoved")
+    }
+
+    private func handleExternalTopologyCommit() {
+        guard enabled, monitoringEnabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        lastExternalTopologyCommitAt = now
+        let uiActive = SwitcherSession.isActive
+        refreshOpenUiAfterExternalCommit = refreshOpenUiAfterExternalCommit || uiActive
+        Self.trace("topology.externalCommit.received", [
+            "uiActive": uiActive,
+            "queryInFlight": queryInFlight,
+            "pendingRefresh": pendingRefresh,
+        ])
+        resumeTopologyQueries(source: "externalCommit")
+        scheduleTopologyRefresh(delay: 0.02, source: "externalCommit")
     }
 
     private func startSubscription() {
@@ -285,9 +369,9 @@ final class AeroSpaceWorkspaceCards {
         if event.event == "focused-workspace-changed", let workspace = event.workspace {
             focusedWorkspace = workspace
             promoteWorkspaceInMru(workspace)
-            scheduleTopologyRefresh(delay: 0.10)
+            scheduleTopologyRefresh(delay: 0.10, source: "subscription.focusedWorkspaceChanged")
         } else if event.event == "window-detected" {
-            scheduleTopologyRefresh(delay: 0.15)
+            scheduleTopologyRefresh(delay: 0.15, source: "subscription.windowDetected")
         }
     }
 
@@ -301,24 +385,84 @@ final class AeroSpaceWorkspaceCards {
     /// Called by AltTab's existing WindowServer stream. Geometry changes are local and need no CLI.
     func notifyWindowServerChange(topologyChanged: Bool) {
         guard enabled else { return }
+        guard !screenLocked else {
+            Self.trace("refresh.topology.skipped", ["source": "windowServer", "reason": "screenLocked"])
+            return
+        }
         if topologyChanged {
-            scheduleTopologyRefresh(delay: 0.18)
+            let now = ProcessInfo.processInfo.systemUptime
+            if let graceUntil = screenUnlockGraceUntil, now < graceUntil {
+                Self.trace("refresh.topology.skipped", [
+                    "source": "windowServer",
+                    "reason": "screenUnlockGrace",
+                    "remainingMs": Int((graceUntil - now) * 1000),
+                ])
+                return
+            }
+            if screenUnlockGraceUntil != nil {
+                screenUnlockGraceUntil = nil
+            }
+            if let commitAt = lastExternalTopologyCommitAt,
+               now - commitAt < externalCommitWindowServerGrace {
+                Self.trace("refresh.topology.skipped", [
+                    "source": "windowServer",
+                    "reason": "externalCommitGrace",
+                    "ageMs": Int((now - commitAt) * 1000),
+                ])
+                return
+            }
+            if let refreshedAt = lastSuccessfulTopologyRefreshAt,
+               now - refreshedAt < successfulRefreshWindowServerCooldown {
+                Self.trace("refresh.topology.skipped", [
+                    "source": "windowServer",
+                    "reason": "successfulRefreshCooldown",
+                    "ageMs": Int((now - refreshedAt) * 1000),
+                ])
+                return
+            }
+            scheduleTopologyRefresh(delay: 0.18, source: "windowServer")
         } else {
             scheduleGeometryRefresh(delay: 0.20)
         }
     }
 
-    private func scheduleTopologyRefresh(delay: TimeInterval) {
+    private func scheduleTopologyRefresh(delay: TimeInterval, source: String) {
+        guard !screenLocked else {
+            Self.trace("refresh.topology.skipped", ["source": source, "reason": "screenLocked"])
+            return
+        }
         if topologyQueriesSuspended {
             if !refreshNeededAfterWake {
-                Self.trace("refresh.skipped.disabled", ["delayMs": Int(delay * 1000)])
+                Self.trace("refresh.skipped.disabled", ["delayMs": Int(delay * 1000), "source": source])
             }
             refreshNeededAfterWake = true
             return
         }
         if queryInFlight {
+            let authoritativeSources: Set<String> = [
+                "externalCommit",
+                "proxyActivation",
+                "subscription.focusedWorkspaceChanged",
+                "subscription.windowDetected",
+                "transition.defaultWorkspace",
+            ]
+            let duplicateSources: Set<String> = [
+                "windowServer",
+                "subscription.focusedWorkspaceChanged",
+                "subscription.windowDetected",
+            ]
+            if let activeRefreshSource,
+               authoritativeSources.contains(activeRefreshSource),
+               duplicateSources.contains(source) {
+                Self.trace("refresh.topology.skipped", [
+                    "source": source,
+                    "reason": "coveredByInFlightAuthoritativeRefresh",
+                    "activeSource": activeRefreshSource,
+                ])
+                return
+            }
             if !pendingRefresh {
-                Self.trace("refresh.coalesced", ["reason": "scheduledWhileQueryInFlight"])
+                Self.trace("refresh.coalesced", ["reason": "scheduledWhileQueryInFlight", "source": source])
             }
             pendingRefresh = true
             return
@@ -339,12 +483,13 @@ final class AeroSpaceWorkspaceCards {
         Self.trace("refresh.topology.scheduled", [
             "delayMs": Int(delay * 1000),
             "replacedPendingWork": replacedPendingWork,
+            "source": source,
         ])
         let work = DispatchWorkItem { [weak self] in
             guard let self, generation == self.topologyRefreshGeneration else { return }
             self.topologyRefreshWorkItem = nil
             self.topologyRefreshDeadline = nil
-            self.refresh()
+            self.refresh(source: source)
         }
         topologyRefreshWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -362,13 +507,26 @@ final class AeroSpaceWorkspaceCards {
     }
 
     private func suspendTopologyQueries(status: Int32) {
+        topologyQueryGeneration &+= 1
         queryInFlight = false
+        activeRefreshSource = nil
         pendingRefresh = false
+        topologyRefreshGeneration &+= 1
+        topologyRefreshWorkItem?.cancel()
+        topologyRefreshWorkItem = nil
+        topologyRefreshDeadline = nil
         let wasSuspended = topologyQueriesSuspended
         topologyQueriesSuspended = true
         refreshNeededAfterWake = false
+        membership.removeAll(keepingCapacity: false)
+        cardsByRepresentative.removeAll(keepingCapacity: false)
+        stickyRepresentativeByWorkspace.removeAll(keepingCapacity: false)
+        focusedWorkspace = "⠀"
+        lastStateFingerprint = ""
+        hasCompletedInitialRefresh = false
+        revision &+= 1
         if !wasSuspended {
-            Self.trace("refresh.suspended", ["status": status])
+            Self.trace("refresh.suspended", ["status": status, "cacheCleared": true])
         }
     }
     private func resumeTopologyQueries(source: String) {
@@ -381,8 +539,12 @@ final class AeroSpaceWorkspaceCards {
     /// Background cache refresh. This is never called from shortcut/show/navigation paths.
     /// forceProbe is reserved for the low-frequency recovery timer and the post-wake probe.
     /// `internal` so SleepWakeEvents can issue a forced probe after AeroSpace boots up again.
-    func refresh(forceProbe: Bool = false) {
+    func refresh(forceProbe: Bool = false, source: String = "direct") {
         guard enabled, FileManager.default.isExecutableFile(atPath: executable) else { return }
+        guard !screenLocked else {
+            Self.trace("refresh.skipped.locked", ["source": source])
+            return
+        }
         guard forceProbe || !topologyQueriesSuspended else {
             refreshNeededAfterWake = true
             return
@@ -393,10 +555,13 @@ final class AeroSpaceWorkspaceCards {
             return
         }
         queryInFlight = true
+        activeRefreshSource = source
+        topologyQueryGeneration &+= 1
+        let queryGeneration = topologyQueryGeneration
         let refreshStartedAt = ProcessInfo.processInfo.systemUptime
-        Self.trace("refresh.started")
+        Self.trace("refresh.started", ["source": source])
         run(["list-windows", "--all", "--json", "--format", "%{window-id} %{workspace}"]) { [weak self] status, data in
-            guard let self else { return }
+            guard let self, queryGeneration == self.topologyQueryGeneration else { return }
             guard status == 0, let entries = try? JSONDecoder().decode([Entry].self, from: data) else {
                 self.consecutiveRefreshFailures += 1
                 Self.trace("refresh.finished", ["ok": false, "stage": "listWindows", "status": status, "durationMs": Self.elapsedMs(since: refreshStartedAt)])
@@ -409,7 +574,7 @@ final class AeroSpaceWorkspaceCards {
             }
             self.resumeTopologyQueries(source: forceProbe ? "recoveryProbe" : "listWindows.success")
             self.run(["list-workspaces", "--focused"]) { [weak self] focusStatus, focusData in
-                guard let self else { return }
+                guard let self, queryGeneration == self.topologyQueryGeneration else { return }
                 self.finishRefresh()
                 guard focusStatus == 0,
                       let value = String(data: focusData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -421,16 +586,30 @@ final class AeroSpaceWorkspaceCards {
                 self.consecutiveRefreshFailures = 0
                 self.apply(entries, focusedWorkspace: value)
                 self.hasCompletedInitialRefresh = true
-                Self.trace("refresh.finished", ["ok": true, "entries": entries.count, "workspace": value, "durationMs": Self.elapsedMs(since: refreshStartedAt)])
+                self.lastSuccessfulTopologyRefreshAt = ProcessInfo.processInfo.systemUptime
+                Self.trace("refresh.finished", ["ok": true, "entries": entries.count, "workspace": value, "durationMs": Self.elapsedMs(since: refreshStartedAt), "source": source])
+                self.refreshOpenUiAfterExternalCommitIfNeeded()
             }
         }
     }
 
+    private func refreshOpenUiAfterExternalCommitIfNeeded() {
+        guard refreshOpenUiAfterExternalCommit else { return }
+        refreshOpenUiAfterExternalCommit = false
+        guard SwitcherSession.isActive else {
+            Self.trace("topology.externalCommit.uiRefreshSkipped", ["reason": "sessionClosed"])
+            return
+        }
+        Self.trace("topology.externalCommit.uiRefreshRequested")
+        App.refreshUiAfterAeroSpaceTopologyCommit()
+    }
+
     private func finishRefresh() {
         queryInFlight = false
+        activeRefreshSource = nil
         guard pendingRefresh else { return }
         pendingRefresh = false
-        scheduleTopologyRefresh(delay: 0.05)
+        scheduleTopologyRefresh(delay: 0.05, source: "pendingFollowUp")
     }
 
     private func setKarabinerSleepingState(_ sleeping: Bool) {
@@ -452,6 +631,11 @@ final class AeroSpaceWorkspaceCards {
                 "status": status,
                 "durationMs": Self.elapsedMs(since: startedAt),
             ])
+            if status == 0 {
+                self.focusedWorkspace = "⠀"
+                self.promoteWorkspaceInMru("⠀")
+                self.scheduleTopologyRefresh(delay: 0.05, source: "transition.defaultWorkspace")
+            }
             completion(status == 0)
         }
     }
@@ -485,6 +669,7 @@ final class AeroSpaceWorkspaceCards {
             self.run(["enable", "off"]) { disableStatus, _ in
                 if disableStatus == 0 {
                     self.setKarabinerSleepingState(true)
+                    self.suspendTopologyQueries(status: 2)
                 }
                 Self.trace("transition.default.sleepCheck.finished", [
                     "status": disableStatus,
@@ -657,7 +842,7 @@ final class AeroSpaceWorkspaceCards {
                 self.resumeTopologyQueries(source: "workspaceProxy.enable")
                 // Focus is latency-critical; the cache refresh remains asynchronous.
                 representative?.focus()
-                self.scheduleTopologyRefresh(delay: 0.10)
+                self.scheduleTopologyRefresh(delay: 0.10, source: "proxyActivation")
             }
             return true
         }

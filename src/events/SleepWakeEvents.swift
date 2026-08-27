@@ -1,6 +1,9 @@
 import Cocoa
 
 class SleepWakeEvents {
+    private static var aeroSpaceRecoveryWorkItem: DispatchWorkItem?
+    private static var suppressAeroSpaceRecoveryUntil: TimeInterval = 0
+
     static func observe() {
         // system sleep/wake and display sleep/wake both suspend our event taps long enough for macOS to
         // disable them with kCGEventTapDisabledByTimeout; we re-enable them on resume (#5723)
@@ -11,15 +14,32 @@ class SleepWakeEvents {
 
     @objc private static func handleWake(_ notification: Notification) {
         Logger.info { "" }
-        AeroSpaceWorkspaceCards.shared.notifyWindowServerChange(topologyChanged: true)
         reEnableAllTaps()
-        // AeroSpace needs a moment to fully restart after wake. The immediate query
-        // often exits with code 2 (suspending all further queries). Issue a forced
-        // probe after 2.5 s so we don't wait the full 60 s recovery timer.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-            AeroSpaceWorkspaceCards.shared.refresh(forceProbe: true)
+
+        // didWakeNotification and screensDidWakeNotification commonly arrive for the
+        // same wake. Coalesce them into one recovery probe. A screen-unlock event has
+        // its own authoritative refresh, so it suppresses this fallback entirely.
+        let now = ProcessInfo.processInfo.systemUptime
+        if now >= suppressAeroSpaceRecoveryUntil {
+            aeroSpaceRecoveryWorkItem?.cancel()
+            let work = DispatchWorkItem {
+                aeroSpaceRecoveryWorkItem = nil
+                AeroSpaceWorkspaceCards.shared.refresh(
+                    forceProbe: true,
+                    source: "systemWakeRecovery"
+                )
+            }
+            aeroSpaceRecoveryWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
         }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { reEnableAllTaps() }
+    }
+
+    static func screenUnlockHandledAeroSpaceRecovery() {
+        suppressAeroSpaceRecoveryUntil = ProcessInfo.processInfo.systemUptime + 3.0
+        aeroSpaceRecoveryWorkItem?.cancel()
+        aeroSpaceRecoveryWorkItem = nil
     }
 
     static func reEnableAllTaps() {

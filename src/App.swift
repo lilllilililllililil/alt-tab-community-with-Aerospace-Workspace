@@ -34,6 +34,7 @@ class App: AppCenterApplication {
     // don't queue multiple delayed rebuildUi() calls
     private static var delayedDisplayScheduled = 0
     private static let switcherUiRefreshThrottler = Throttler(delayInMs: 200)
+    private static let aeroSpaceTopologyUiRefreshThrottler = Throttler(delayInMs: 120)
 
     override init() {
         super.init()
@@ -61,8 +62,11 @@ class App: AppCenterApplication {
         Logger.info { "active:\(SwitcherSession.isActive)" }
         // Cancel any pending reveal so a fast Cmd+Tab (released before the 50 ms window)
         // never builds or shows the panel at all.
-        SwitcherSession.current?.pendingRevealWorkItem?.cancel()
-        SwitcherSession.current?.pendingRevealWorkItem = nil
+        if SwitcherSession.current?.pendingRevealWorkItem != nil {
+            AeroSpaceWorkspaceCards.shared.traceUiEvent("ui.reveal.cancelled", shortcutIndex: SwitcherSession.activeShortcutIndex)
+            SwitcherSession.current?.pendingRevealWorkItem?.cancel()
+            SwitcherSession.current?.pendingRevealWorkItem = nil
+        }
         guard SwitcherSession.current != nil else { return } // already hidden
         SwitcherSession.current = nil
         KeyboardEvents.updateEscapeAbsorptionTap() // session closed: stop tapping keyDown (#5766)
@@ -264,6 +268,22 @@ class App: AppCenterApplication {
         }
     }
 
+    /// Rebuilds only the open switcher projection after an explicit AeroSpace move commit.
+    /// No thumbnail capture is requested here; the existing cached thumbnails are reused.
+    static func refreshUiAfterAeroSpaceTopologyCommit() {
+        aeroSpaceTopologyUiRefreshThrottler.throttleOrProceed {
+            guard SwitcherSession.isActive else {
+                AeroSpaceWorkspaceCards.shared.traceUiEvent("topology.externalCommit.uiRefreshSkipped")
+                return
+            }
+            guard Windows.updatesBeforeShowing() else {
+                hideUi()
+                return
+            }
+            refreshUi(true)
+        }
+    }
+
     static func refreshUi(_ preserveScrollPosition: Bool = false) {
         guard SwitcherSession.isActive else { return }
         let preservedScrollOrigin = preserveScrollPosition ? TilesView.currentScrollOrigin() : nil
@@ -313,7 +333,18 @@ class App: AppCenterApplication {
             if Preferences.windowDisplayDelay == DispatchTimeInterval.milliseconds(0) {
                 // 50 ms pending-reveal: if the trigger is released before this fires,
                 // hideUi() cancels the item and the panel is never built (fast A/B).
-                let work = DispatchWorkItem { buildUiAndShowPanel() }
+                AeroSpaceWorkspaceCards.shared.traceUiEvent("ui.reveal.scheduled", shortcutIndex: shortcutIndex)
+                let work = DispatchWorkItem {
+                    if SwitcherSession.current === session {
+                        session.pendingRevealWorkItem = nil
+                    }
+                    guard SwitcherSession.isActive else {
+                        AeroSpaceWorkspaceCards.shared.traceUiEvent("ui.reveal.skipped", shortcutIndex: shortcutIndex)
+                        return
+                    }
+                    AeroSpaceWorkspaceCards.shared.traceUiEvent("ui.reveal.executed", shortcutIndex: shortcutIndex)
+                    buildUiAndShowPanel()
+                }
                 session.pendingRevealWorkItem = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50), execute: work)
             } else {

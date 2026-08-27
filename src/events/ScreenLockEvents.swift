@@ -27,6 +27,7 @@ class ScreenLockEvents {
         isScreenLocked = false
         // a locked/idle screen can let macOS disable our event taps (kCGEventTapDisabledByTimeout); re-enable on unlock (#5723)
         SleepWakeEvents.reEnableAllTaps()
+        SleepWakeEvents.screenUnlockHandledAeroSpaceRecovery()
         AeroSpaceWorkspaceCards.shared.resumeAfterScreenLock()
     }
 }
